@@ -123,7 +123,10 @@ async def maybe_handoff_worker_reply(
         _persist_unavailable_hold(payload)
         logger.warning("fleet delegation intake unavailable; holding the reply for recovery")
         return True
-    applied = await _apply_correlated(adapter, result.get("plan") or {})
+    plan = result.get("plan") if isinstance(result.get("plan"), dict) else {}
+    applied = await _apply_correlated(adapter, plan)
+    if applied:
+        await _post_thread_evaluation(adapter, channel_id, plan)
     return applied
 
 
@@ -624,9 +627,31 @@ async def _resume_human_session(worker_adapter: Any, plan: dict) -> bool:
         if getattr(event, "_on_processing_complete", None) is _watch:
             event._on_processing_complete = None
     if observed.get("outcome") == ProcessingOutcome.SUCCESS or _ledger_owns_report(plan):
+        text = getattr(event, "_streamed_final_response", "")
+        plan["_evaluation_text"] = text if isinstance(text, str) else ""
+        plan["_evaluation_ready"] = True
         return True
     logger.warning("fleet delegation handoff produced no report; the reply stays pending")
     return False
+
+
+async def _post_thread_evaluation(adapter: Any, channel_id: str, plan: dict) -> None:
+    """Copy one accepted evaluation into the coordination thread.
+
+    Failure here does not release the human-report claim and does not
+    start another model turn. The legacy coordination DM is not a target.
+    """
+    from gateway.fleet_coordination import evaluation_body, should_post_evaluation
+
+    if not should_post_evaluation(channel_id, plan):
+        return
+    body = evaluation_body(str(plan.get("delegation_id") or ""), plan.get("_evaluation_text"))
+    if body is None:
+        return
+    try:
+        await adapter.send(channel_id, body, reply_to=plan.get("inbound_event_id"))
+    except Exception:
+        logger.warning("fleet coordination evaluation was not posted", exc_info=True)
 
 
 def _ledger_owns_report(plan: dict) -> bool:

@@ -1524,6 +1524,35 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_parent_id = _event_reply_parent_id(event)
         reply_meta = self._lookup_event_meta(state, reply_parent_id) if reply_parent_id else None
         reply_to_is_own = bool(reply_meta is not None and reply_meta[0] == self._self_pubkey)
+        from gateway.fleet_coordination import coordination_disposition
+        from gateway.fleet_delegation import integration_enabled
+
+        disposition = coordination_disposition(
+            channel_id=channel_id,
+            event=event,
+            self_pubkey=self._self_pubkey,
+            control_integration=integration_enabled(),
+        )
+        if disposition == "suppress":
+            return
+        if disposition == "control":
+            # A coordination chat is a record, not a session. Only a reply
+            # can be a recorded worker result. Everything else stays silent.
+            if reply_parent_id:
+                from gateway.fleet_delegation import maybe_handoff_worker_reply
+
+                await maybe_handoff_worker_reply(
+                    self,
+                    channel_id=channel_id,
+                    sender_public_key_hex=pubkey,
+                    inbound_text=self._strip_mention(content),
+                    inbound_event_id=event_id,
+                    reply_to_message_id=reply_parent_id,
+                    reply_to_text=reply_meta[1] if reply_meta else None,
+                    chat_type="dm" if is_dm else "group",
+                    created_at=created_at,
+                )
+            return
         # Channels dispatch only when addressed (@mention or p-tag) or replying to us (Signal/WhatsApp parity),
         # unless require_mention is off. DMs always dispatch.
         if not is_dm and self.require_mention and not self._is_addressed(event) and not reply_to_is_own:
