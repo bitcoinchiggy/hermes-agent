@@ -21,8 +21,11 @@ from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
-CONTROL = Path(os.environ.get("HERMES_FLEET_CONTROL_ROOT", ""))
-if CONTROL.is_dir():
+_control_root = os.environ.get("HERMES_FLEET_CONTROL_ROOT", "").strip()
+# An empty value is not the current directory. Path("") is ".", and putting
+# this repo's tests/ first would shadow the product gateway package.
+CONTROL = Path(_control_root) if _control_root else Path("/nonexistent")
+if _control_root and CONTROL.is_dir():
     sys.path.insert(0, str(CONTROL))
     sys.path.insert(0, str(CONTROL / "tests"))
 
