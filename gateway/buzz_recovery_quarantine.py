@@ -70,7 +70,13 @@ def coordination_chat_id() -> Optional[str]:
 
 
 def unanchored_coordination_destination(row: dict) -> bool:
-    """True only for a parentless Buzz row whose chat is the configured coordination DM."""
+    """True for a parentless Buzz row whose chat is a known coordination destination.
+
+    A missing configuration publishes the row. An unreadable or malformed
+    configuration quarantines only chats already known by id, including
+    journal channel ids. Other chats, including human reports, are published.
+    Message text is not the destination.
+    """
     if str(row.get("platform") or "") != "buzz":
         return False
     parent = row.get("reply_to_message_id")
@@ -79,10 +85,17 @@ def unanchored_coordination_destination(row: dict) -> bool:
             return False
     elif parent is not None:
         return False
-    configured = coordination_chat_id()
-    if configured is None:
+    from gateway.fleet_coordination import journal_chat_ids, load_coordination_settings
+
+    loaded = load_coordination_settings()
+    chat = str(row.get("chat_id") or "").strip().lower()
+    if not chat:
         return False
-    return str(row.get("chat_id") or "").strip() == configured
+    if loaded.degraded:
+        return chat in loaded.known_chats() or chat in journal_chat_ids()
+    if loaded.status != "ready":
+        return False
+    return loaded.destination(chat) is not None
 
 
 def quarantine_unanchored_buzz_result(
