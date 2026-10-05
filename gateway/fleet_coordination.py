@@ -14,7 +14,9 @@ an input here and does not grant permission to assign work.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,58 +42,236 @@ REQUEST_DUMP_MAX_BYTES = 256 * 1024 * 1024
 
 @dataclass(frozen=True)
 class CoordinationSettings:
-    """Public destinations and the only pubkey whose top-level marker is work."""
+    """Public destinations and the only pubkey whose top-level marker is work.
+
+    ``status`` is ``ready`` or ``absent`` when the file can be trusted.
+    ``unreadable`` and ``malformed`` keep previously known chat ids and
+    do not authorize a new assignment.
+    """
 
     channel_id: Optional[str] = None
     legacy_dm_id: Optional[str] = None
     assigner_pubkey: Optional[str] = None
+    status: str = "ready"
+    remembered: tuple[str, ...] = ()
 
     def destination(self, chat_id: str) -> Optional[str]:
         """``channel``, ``legacy``, or None when this chat is not coordination."""
-        text = str(chat_id or "").strip().lower()
+        text = _chat_key(chat_id)
         if self.channel_id and text == self.channel_id:
             return "channel"
         if self.legacy_dm_id and text == self.legacy_dm_id.lower():
             return "legacy"
         return None
 
+    def known_chats(self) -> frozenset[str]:
+        """Chat ids that are coordination destinations by identity, not by text."""
+        found = {item for item in self.remembered if item}
+        if self.channel_id:
+            found.add(self.channel_id)
+        if self.legacy_dm_id:
+            found.add(self.legacy_dm_id.lower())
+        return frozenset(found)
 
-def settings_path() -> Optional[Path]:
-    """Config beside the delivery ledger. Missing or unreadable is no destination."""
+    @property
+    def degraded(self) -> bool:
+        return self.status in {"unreadable", "malformed"}
+
+
+def _home() -> Optional[Path]:
     try:
         from gateway.delivery_ledger import _db_path
 
-        path = _db_path().parent / "config.yaml"
+        return _db_path().parent
     except Exception:
         logger.warning("Coordination settings path was not resolved", exc_info=True)
         return None
+
+
+def settings_path() -> Optional[Path]:
+    """Config beside the delivery ledger. A missing file is not a destination."""
+    home = _home()
+    if home is None:
+        return None
+    path = home / "config.yaml"
     if path.is_symlink() or not path.is_file():
         return None
     return path
 
 
+def _known_path(home: Path) -> Path:
+    return home / "fleet-coordination-known.json"
+
+
+def _read_known(home: Optional[Path]) -> tuple[str, ...]:
+    """Public ids from the last ready load. A bad cache adds nothing."""
+    if home is None:
+        return ()
+    path = _known_path(home)
+    if path.is_symlink() or not path.is_file():
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        logger.warning("Coordination destination cache was not read", exc_info=True)
+        return ()
+    if not isinstance(payload, dict):
+        return ()
+    found: list[str] = []
+    channel = _uuid(payload.get("channel_id"))
+    legacy = _chat_id(payload.get("legacy_dm_id"))
+    if channel:
+        found.append(channel)
+    if legacy:
+        found.append(legacy.lower())
+    return tuple(found)
+
+
+def _write_known(home: Optional[Path], settings: CoordinationSettings) -> None:
+    if home is None or settings.degraded or not settings.known_chats():
+        return
+    path = _known_path(home)
+    if path.is_symlink():
+        logger.warning("Coordination destination cache is a symlink; not writing it")
+        return
+    payload = {
+        "channel_id": settings.channel_id,
+        "legacy_dm_id": settings.legacy_dm_id,
+        "assigner_pubkey": settings.assigner_pubkey,
+    }
+    temp = home / f".fleet-coordination-known.{os.getpid()}.tmp"
+    try:
+        temp.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.warning("Coordination destination cache was not written", exc_info=True)
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+
+
 def load_coordination_settings(path: Optional[Path] = None) -> CoordinationSettings:
-    """Read the public Fleet keys. An unreadable file identifies nothing."""
-    target = path if path is not None else settings_path()
+    """Read the public Fleet keys.
+
+    A missing file or a fleet section with none of these keys is
+    ``absent``: nothing is a coordination chat. An unreadable file, a
+    symlink, or a present key that is not a valid id is degraded. The
+    last ready ids stay known. Message text is not a destination.
+    """
+    home = _home()
+    target = path if path is not None else (None if home is None else home / "config.yaml")
+    remembered = _read_known(home if path is None else (target.parent if target is not None else None))
     if target is None or target.is_symlink() or not target.is_file():
-        return CoordinationSettings()
+        if target is not None and target.is_symlink():
+            return CoordinationSettings(status="unreadable", remembered=remembered)
+        return CoordinationSettings(status="absent", remembered=())
     try:
         import hermes_yaml as yaml
 
         loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("Coordination settings were not read", exc_info=True)
-        return CoordinationSettings()
+        return CoordinationSettings(status="unreadable", remembered=remembered)
     if not isinstance(loaded, dict):
-        return CoordinationSettings()
+        return CoordinationSettings(status="malformed", remembered=remembered)
+    if "fleet" not in loaded or loaded.get("fleet") is None:
+        return CoordinationSettings(status="absent", remembered=())
     fleet = loaded.get("fleet")
     if not isinstance(fleet, dict):
-        return CoordinationSettings()
-    return CoordinationSettings(
-        channel_id=_uuid(fleet.get("coordination_channel_id")),
-        legacy_dm_id=_chat_id(fleet.get("control_coordination_chat_id")),
-        assigner_pubkey=_pubkey(fleet.get("control_assigner_pubkey")),
+        return CoordinationSettings(status="malformed", remembered=remembered)
+    present = [key for key in (
+        "coordination_channel_id",
+        "control_coordination_chat_id",
+        "control_assigner_pubkey",
+    ) if key in fleet and fleet.get(key) not in (None, "")]
+    if not present:
+        return CoordinationSettings(status="absent", remembered=())
+    channel = _uuid(fleet.get("coordination_channel_id")) if "coordination_channel_id" in fleet else None
+    legacy = _chat_id(fleet.get("control_coordination_chat_id")) if "control_coordination_chat_id" in fleet else None
+    assigner = _pubkey(fleet.get("control_assigner_pubkey")) if "control_assigner_pubkey" in fleet else None
+    malformed = (
+        ("coordination_channel_id" in fleet and fleet.get("coordination_channel_id") not in (None, "") and channel is None)
+        or ("control_coordination_chat_id" in fleet and fleet.get("control_coordination_chat_id") not in (None, "") and legacy is None)
+        or ("control_assigner_pubkey" in fleet and fleet.get("control_assigner_pubkey") not in (None, "") and assigner is None)
     )
+    if malformed:
+        partial = CoordinationSettings(
+            channel_id=channel,
+            legacy_dm_id=legacy,
+            assigner_pubkey=None,
+            status="malformed",
+            remembered=remembered,
+        )
+        return partial
+    ready = CoordinationSettings(
+        channel_id=channel,
+        legacy_dm_id=legacy,
+        assigner_pubkey=assigner,
+        status="ready",
+        remembered=remembered,
+    )
+    _write_known(target.parent, ready)
+    return ready
+
+
+def journal_chat_ids(directory: Optional[Path] = None) -> frozenset[str]:
+    """Channel ids stored on delegation records. Text is not consulted."""
+    folder = directory
+    if folder is None:
+        try:
+            from gateway.fleet_delegation import _journal_base
+
+            folder = _journal_base()
+        except Exception:
+            logger.warning("Coordination journal was not resolved", exc_info=True)
+            return frozenset()
+    if folder is None or folder.is_symlink() or not folder.is_dir():
+        return frozenset()
+    found: set[str] = set()
+    try:
+        paths = list(folder.glob("*.json"))
+    except OSError:
+        return frozenset()
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("delegation_id"), str):
+            continue
+        channel = _uuid(payload.get("channel_id")) or _chat_id(payload.get("channel_id"))
+        if channel:
+            found.add(channel.lower())
+    return frozenset(found)
+
+
+def held_chat_ids(home: Optional[Path] = None) -> frozenset[str]:
+    """Chats a quarantine hold removed from ordinary dispatch."""
+    root = home if home is not None else _home()
+    if root is None:
+        return frozenset()
+    path = root / "buzz" / "coordination-dispatch-hold.json"
+    if path.is_symlink() or not path.is_file():
+        return frozenset()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        logger.warning("Coordination dispatch hold was not read", exc_info=True)
+        return frozenset()
+    chats = payload.get("chats") if isinstance(payload, dict) else None
+    if not isinstance(chats, list):
+        return frozenset()
+    found: set[str] = set()
+    for item in chats:
+        channel = _uuid(item) or _chat_id(item)
+        if channel:
+            found.add(channel.lower())
+    return frozenset(found)
 
 
 def coordination_disposition(
@@ -108,8 +288,21 @@ def coordination_disposition(
     model turn in this chat. ``assignment`` is the one worker execution.
     ``suppress`` drops notices, errors, acknowledgements, reactions,
     startup and shutdown rows, evaluations, and every other member.
+
+    A degraded config or a quarantine hold identifies chats by id. It
+    does not read the message body. Human chats stay on ``normal``.
     """
     loaded = settings if settings is not None else load_coordination_settings()
+    key = _chat_key(channel_id)
+    if settings is None and key in held_chat_ids():
+        return "control" if control_integration else "suppress"
+    if loaded.degraded:
+        known = set(loaded.known_chats())
+        if control_integration:
+            known |= set(journal_chat_ids())
+        if key not in known:
+            return "normal"
+        return "control" if control_integration else "suppress"
     if loaded.destination(channel_id) is None:
         return "normal"
     if control_integration:
@@ -154,7 +347,7 @@ def should_post_evaluation(channel_id: str, plan: dict, settings: Optional[Coord
     if not isinstance(plan, dict) or plan.get("_evaluation_ready") is not True:
         return False
     loaded = settings if settings is not None else load_coordination_settings()
-    if loaded.destination(channel_id) != "channel":
+    if loaded.degraded or loaded.destination(channel_id) != "channel":
         return False
     event_id = plan.get("inbound_event_id")
     if not isinstance(event_id, str) or not _HEX64_RE.fullmatch(event_id):
@@ -246,6 +439,10 @@ def _chat_id(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not text or any(char in text for char in "\n\r\x00"):
+    if not text or any(char in text for char in "\n\r\x00") or len(text) > 128:
         return None
     return text
+
+
+def _chat_key(value: object) -> str:
+    return str(value or "").strip().lower()

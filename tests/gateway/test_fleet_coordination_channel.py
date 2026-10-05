@@ -287,3 +287,136 @@ def test_unconfigured_channel_still_dispatches_an_addressed_message(monkeypatch)
         )
     )
     adapter._dispatch_message.assert_awaited()
+
+
+def test_degraded_config_uses_chat_identity_and_not_message_text():
+    settings = CoordinationSettings(status="unreadable", remembered=(LEGACY,))
+    human_text = _event(
+        f"[fleet-delegation {DELEGATION}]\nthis is a human conversation",
+        mentioned=[WORKER_A],
+    )
+    assert (
+        coordination_disposition(
+            channel_id=OTHER,
+            event=human_text,
+            self_pubkey=WORKER_A,
+            control_integration=False,
+            settings=settings,
+        )
+        == "normal"
+    )
+    assert (
+        coordination_disposition(
+            channel_id=LEGACY,
+            event=_assignment(),
+            self_pubkey=WORKER_A,
+            control_integration=False,
+            settings=settings,
+        )
+        == "suppress"
+    )
+    assert (
+        coordination_disposition(
+            channel_id=LEGACY,
+            event=_event("HTTP 402"),
+            self_pubkey=WORKER_A,
+            control_integration=False,
+            settings=settings,
+        )
+        == "suppress"
+    )
+
+
+def test_degraded_control_correlates_a_reply_and_leaves_other_chats(monkeypatch):
+    _use(monkeypatch, CoordinationSettings(status="malformed", remembered=(CHANNEL,)))
+    monkeypatch.setattr("gateway.fleet_delegation.integration_enabled", lambda: True)
+    handoff = AsyncMock(return_value=False)
+    monkeypatch.setattr("gateway.fleet_delegation.maybe_handoff_worker_reply", handoff)
+    adapter = _adapter(ASSIGNER)
+    asyncio.run(adapter._handle_event(CHANNEL, _state(), _event("HTTP 402", author=WORKER_A, event_id="6" * 64)))
+    handoff.assert_not_awaited()
+    adapter._dispatch_message.assert_not_awaited()
+    reply = _event("worker result", author=WORKER_A, reply_to=ASSIGNMENT, event_id=RESULT)
+    asyncio.run(adapter._handle_event(CHANNEL, _state(), reply))
+    handoff.assert_awaited()
+    adapter._dispatch_message.assert_not_awaited()
+    asyncio.run(
+        adapter._handle_event(
+            OTHER,
+            _state("dm"),
+            _event(
+                f"[fleet-delegation {DELEGATION}]\nhello",
+                author="f" * 64,
+                mentioned=[WORKER_A],
+                event_id="7" * 64,
+            ),
+        )
+    )
+    adapter._dispatch_message.assert_awaited()
+
+
+def test_unreadable_config_remembers_the_last_ready_destination(tmp_path, monkeypatch):
+    from gateway.fleet_coordination import load_coordination_settings
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("gateway.fleet_coordination._home", lambda: home)
+    (home / "config.yaml").write_text(
+        "fleet:\n"
+        f"  coordination_channel_id: {CHANNEL}\n"
+        f"  control_assigner_pubkey: {ASSIGNER}\n",
+        encoding="utf-8",
+    )
+    ready = load_coordination_settings()
+    assert ready.status == "ready"
+    assert ready.channel_id == CHANNEL
+    (home / "config.yaml").write_text("fleet: [\n", encoding="utf-8")
+    broken = load_coordination_settings()
+    assert broken.status == "unreadable"
+    assert CHANNEL in broken.known_chats()
+    (home / "config.yaml").write_text(
+        "fleet:\n"
+        "  coordination_channel_id: not-a-uuid\n"
+        f"  control_coordination_chat_id: {LEGACY}\n",
+        encoding="utf-8",
+    )
+    malformed = load_coordination_settings()
+    assert malformed.status == "malformed"
+    assert CHANNEL in malformed.known_chats()
+    assert LEGACY in malformed.known_chats()
+    assert malformed.assigner_pubkey is None
+
+
+def test_journal_channel_is_known_without_reading_the_task(tmp_path, monkeypatch):
+    from gateway.fleet_coordination import journal_chat_ids
+
+    journal = tmp_path / "delegations"
+    journal.mkdir()
+    (journal / f"{DELEGATION}.json").write_text(
+        '{"delegation_id": "%s", "channel_id": "%s", "task": "HTTP 402", "state": "accepted"}'
+        % (DELEGATION, LEGACY),
+        encoding="utf-8",
+    )
+    assert journal_chat_ids(journal) == frozenset({LEGACY})
+    monkeypatch.setattr("gateway.fleet_coordination.journal_chat_ids", lambda directory=None: frozenset({LEGACY}))
+    settings = CoordinationSettings(status="unreadable")
+    assert (
+        coordination_disposition(
+            channel_id=LEGACY,
+            event=_event("ack"),
+            self_pubkey=ASSIGNER,
+            control_integration=True,
+            settings=settings,
+        )
+        == "control"
+    )
+    assert (
+        coordination_disposition(
+            channel_id=OTHER,
+            event=_event("ack"),
+            self_pubkey=ASSIGNER,
+            control_integration=True,
+            settings=settings,
+        )
+        == "normal"
+    )

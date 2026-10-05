@@ -1533,7 +1533,9 @@ def dump_api_request_debug(
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
-        prune_request_dumps(agent.logs_dir, safe_sid)
+        pruned = prune_request_dumps(agent.logs_dir, safe_sid)
+        if not pruned.get("within_budget"):
+            logger.warning("Request debug dumps are over the byte budget or could not be pruned")
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
             print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
@@ -1544,36 +1546,56 @@ def dump_api_request_debug(
         return None
 
 
-def prune_request_dumps(logs_dir: Path, session_id: str, *, keep: int = 20, max_bytes: int = 256 * 1024 * 1024) -> None:
-    """Keep the newest request dumps for one session, then the newest bytes overall.
+def prune_request_dumps(logs_dir: Path, session_id: str, *, keep: int = 20, max_bytes: int = 256 * 1024 * 1024) -> dict:
+    """Keep the newest request dumps for one session inside a hard byte budget.
 
     Only ``request_dump_*.json`` files are removed. Session transcripts and
-    journals are not. The newest dump for ``session_id`` is kept even when
-    that one file is larger than ``max_bytes``.
+    journals are not. A file is not exempt because it is newest: if the
+    remaining dumps still exceed ``max_bytes``, the oldest are removed
+    until the sum fits, including the file just written. A failed unlink
+    is reported and does not count as budget met.
     """
+    result = {"removed": 0, "bytes_remaining": 0, "within_budget": False, "cleanup_failed": False}
     if keep < 1 or max_bytes < 1 or not isinstance(logs_dir, Path):
-        return
+        result["cleanup_failed"] = True
+        return result
     try:
         own = _request_dump_files(logs_dir, f"request_dump_{session_id}_")
         own.sort(key=lambda path: (path.stat().st_mtime, path.name))
         for path in own[:-keep]:
-            _unlink_dump(path)
-        newest = own[-1] if own else None
+            if _unlink_dump(path):
+                result["removed"] += 1
+            else:
+                result["cleanup_failed"] = True
         remaining = _request_dump_files(logs_dir, "request_dump_")
-        total = sum(path.stat().st_size for path in remaining)
-        if total <= max_bytes:
-            return
-        remaining.sort(key=lambda path: (path.stat().st_mtime, path.name))
+        total = 0
+        sized: list[tuple[Path, int, float]] = []
         for path in remaining:
+            try:
+                stat = path.stat()
+                size = stat.st_size
+                mtime = stat.st_mtime
+            except OSError:
+                result["cleanup_failed"] = True
+                continue
+            sized.append((path, size, mtime))
+            total += size
+        sized.sort(key=lambda item: (item[2], item[0].name))
+        for path, size, _mtime in sized:
             if total <= max_bytes:
                 break
-            if newest is not None and path.resolve() == newest.resolve():
-                continue
-            size = path.stat().st_size
             if _unlink_dump(path):
                 total -= size
+                result["removed"] += 1
+            else:
+                result["cleanup_failed"] = True
+        result["bytes_remaining"] = max(total, 0)
+        result["within_budget"] = total <= max_bytes and not result["cleanup_failed"]
     except Exception:
         logger.warning("Failed to prune API request debug dumps", exc_info=True)
+        result["cleanup_failed"] = True
+        result["within_budget"] = False
+    return result
 
 
 def _request_dump_files(logs_dir: Path, prefix: str) -> list[Path]:
