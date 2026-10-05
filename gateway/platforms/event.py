@@ -58,8 +58,9 @@ class MessageEvent:
     # (/queue) chain answers the LAST message of the chain, so its final send has to be ledgered
     # under that message's id. Keyed on the opening event's id instead, two chained turns carrying
     # the same text collide on one obligation id and the earlier turn's row is overwritten (a
-    # refused first reply then reads as delivered). Reply routing is unaffected: the reply anchor
-    # still comes from this event.
+    # refused first reply then reads as delivered). The reply parent of that same
+    # send is the terminal turn's anchor when ``_terminal_reply_anchor_set`` is
+    # set. The opening turn's body was already sent against its own anchor.
     ledger_message_id: Optional[str] = None
     # Reply anchor for the final send when the answer is to a DIFFERENT message than the one that
     # opened the turn: a successful busy redirect turns the running turn onto the redirecting

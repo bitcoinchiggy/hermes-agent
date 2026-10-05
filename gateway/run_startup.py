@@ -426,7 +426,13 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, mark_delivered, mark_failed, mark_quarantined,
+                recovered_reply_metadata,
+            )
+            from gateway.buzz_recovery_quarantine import (
+                quarantine_unanchored_buzz_result, unanchored_coordination_destination,
+            )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -442,9 +448,36 @@ class GatewayStartupMixin:
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            reply_parent = row.get("reply_to_message_id") or None
+            # Quarantine only a parentless Buzz row addressed to the coordination
+            # DM named in this home's config. Every other destination is sent.
+            if unanchored_coordination_destination(row):
+                stored = False
+                with _log_suppressed(logging.DEBUG, "Buzz recovery quarantine failed", exc_info=True):
+                    stored = await asyncio.to_thread(
+                        quarantine_unanchored_buzz_result,
+                        obligation_id=str(row.get("obligation_id") or ""),
+                        chat_id=str(row.get("chat_id") or ""),
+                        thread_id=row.get("thread_id"),
+                        content=str(row.get("content") or ""),
+                    )
+                if stored:
+                    with _log_suppressed(logging.DEBUG, "Buzz recovery quarantine state failed", exc_info=True):
+                        await asyncio.to_thread(mark_quarantined, row["obligation_id"])
+                    logger.info(
+                        "Quarantined unanchored Buzz recovery for %s (obligation %s); not published",
+                        row.get("chat_id"), row.get("obligation_id"),
+                    )
+                else:
+                    logger.warning(
+                        "Unanchored Buzz recovery %s was not stored and was not published",
+                        row.get("obligation_id"),
+                    )
+                continue
+            metadata = recovered_reply_metadata(row.get("thread_id"), reply_parent)
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                result = await adapter.send(
+                    chat_id=row["chat_id"], content=content, reply_to=reply_parent, metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
@@ -751,11 +784,15 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
+                # The origin's own triggering message, when the session stored one.
+                # A missing id stays unanchored. A later inbound is not consulted.
+                origin_parent = getattr(origin, "message_id", None)
                 await asyncio.to_thread(
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
+                    reply_to_message_id=str(origin_parent) if origin_parent else None)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

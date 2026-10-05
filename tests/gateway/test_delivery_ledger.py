@@ -39,6 +39,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        reply_to_message_id=kw.get("reply_to_message_id"),
     )
 
 
@@ -124,6 +125,7 @@ class TestSchemaMigration:
             conn.close()
 
         assert "adapter_profile" in columns
+        assert "reply_to_message_id" in columns
 
 
 class TestStateMachine:
@@ -149,6 +151,19 @@ class TestSweep:
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
 
+    def test_claim_keeps_a_stored_reply_parent_and_leaves_a_legacy_row_bare(self):
+        _record(oid="ob-parent", reply_to_message_id="parent-event", thread_id="topic-root")
+        _record(oid="ob-legacy", thread_id=None)
+        _orphan("ob-parent")
+        _orphan("ob-legacy")
+
+        claimed = {row["obligation_id"]: row for row in dl.sweep_recoverable()}
+
+        assert claimed["ob-parent"]["thread_id"] == "topic-root"
+        assert claimed["ob-parent"]["reply_to_message_id"] == "parent-event"
+        assert claimed["ob-legacy"]["thread_id"] is None
+        assert claimed["ob-legacy"]["reply_to_message_id"] is None
+
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
         _orphan("ob-1")
@@ -163,6 +178,16 @@ class TestSweep:
 
 class TestRuntimeFailedSweep:
     """A live gateway may reclaim only its own transient reconnect failures."""
+
+    def test_runtime_claim_keeps_the_stored_reply_parent(self):
+        _record(platform="telegram", reply_to_message_id="parent-event", thread_id="topic-root")
+        dl.mark_failed("ob-1", "send_path_degraded")
+
+        claimed = dl.sweep_failed_for_runtime("telegram")
+
+        assert len(claimed) == 1
+        assert claimed[0]["thread_id"] == "topic-root"
+        assert claimed[0]["reply_to_message_id"] == "parent-event"
 
     def test_claims_current_process_send_path_degraded_row(self):
         _record(platform="telegram")

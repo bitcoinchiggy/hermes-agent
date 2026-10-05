@@ -39,6 +39,39 @@ _MAX_ROWS = 500
 # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
 # occurred, but a network rejection's acknowledgement can still have been lost independently.
 RECOVERED_MARKER = "♻️ Recovered reply — the gateway restarted during delivery, so this may be a duplicate:\n\n"
+
+
+def _stored_anchor(value: Optional[str]) -> Optional[str]:
+    """A ledger anchor, or None when the row did not store one.
+
+    Empty and whitespace-only values are absent. Callers must not fill that
+    gap from a later event.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def recovered_reply_metadata(
+    thread_id: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Metadata for a recovered final.
+
+    ``thread_id`` is the stored thread root. ``reply_to_message_id`` is the
+    immediate reply parent of the send that created the obligation. They stay
+    separate fields. A missing parent stays missing: a legacy row is not
+    attached to a later event and is not turned into a delegation reply.
+    """
+    metadata: Dict[str, str] = {}
+    root = _stored_anchor(thread_id)
+    parent = _stored_anchor(reply_to_message_id)
+    if root:
+        metadata["thread_id"] = root
+    if parent:
+        metadata["reply_to_message_id"] = parent
+    return metadata or None
 RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconnected after the original "
                       "delivery failed, so this may be a duplicate:\n\n")
 # A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
@@ -201,11 +234,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            reply_to_message_id TEXT
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "reply_to_message_id" not in columns:
+        add_column_if_missing(
+            conn, "delivery_obligations", "reply_to_message_id", "reply_to_message_id TEXT")
 
 
 def _transaction():
@@ -268,18 +306,25 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      reply_to_message_id: Optional[str] = None) -> None:
+    """Record a final response as owed to the platform (state='pending').
+
+    ``thread_id`` is the thread root. ``reply_to_message_id`` is the immediate
+    reply parent of this send. A caller that does not have one passes None;
+    the row stays unanchored rather than borrowing another event.
+    """
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+                owner_pid, owner_started_at, adapter_profile, reply_to_message_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+            (obligation_id, session_key, platform, str(chat_id), _stored_anchor(thread_id),
+             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
+             _stored_anchor(reply_to_message_id)))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -287,24 +332,29 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                             thread_id: Optional[str], content: str, since: float,
-                            adapter_profile: Optional[str] = None) -> None:
+                            adapter_profile: Optional[str] = None,
+                            reply_to_message_id: Optional[str] = None) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    since *since* (the turn start), and idempotent across boots that die before their sweep.
+
+    ``reply_to_message_id`` is stored only when the interrupted turn's origin already
+    has that parent. None stays NULL. This does not look up a later inbound.
+    """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?
+                owner_pid, owner_started_at, adapter_profile, reply_to_message_id)
+               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?
                WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
                                  WHERE session_key = ? AND content = ? AND created_at >= ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+            (obligation_id, session_key, platform, str(chat_id), _stored_anchor(thread_id),
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
-             session_key, content, since))
+             _stored_anchor(reply_to_message_id), session_key, content, since))
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -313,6 +363,21 @@ def mark_attempting(obligation_id: str) -> None:
 
 def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
+
+
+def mark_quarantined(obligation_id: str) -> None:
+    """Keep an unanchored Buzz recovery as evidence. This does not publish it or set a parent."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='quarantined', updated_at=?, last_error=?
+               WHERE obligation_id=?""",
+            (
+                time.time(),
+                "quarantined: no recoverable delegation parent; not published",
+                obligation_id,
+            ),
+        )
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
@@ -350,6 +415,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
+                 reply_to_message_id: Optional[str] = None,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
                  last_error: Optional[str] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
@@ -359,7 +425,8 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
     marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
-            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
+            "thread_id": thread_id, "reply_to_message_id": _stored_anchor(reply_to_message_id),
+            "content": content, "needs_marker": needs_marker,
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
@@ -389,14 +456,15 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id, reply_to_message_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
+        for (oid, session_key, platform, chat_id, thread_id, reply_to_message_id, content, state,
+             attempts, created_at, owner_pid, owner_started_at, adapter_profile, last_error,
+             updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -420,7 +488,9 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 if cursor.rowcount:
                     claimed.append({
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
-                        "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                        "chat_id": chat_id, "thread_id": thread_id,
+                        "reply_to_message_id": _stored_anchor(reply_to_message_id),
+                        "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error)})
                 continue
@@ -440,9 +510,10 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # mid-await, other rejection, a flood refusal whose earlier chunks the platform may have
                 # accepted, or a pending row an older build already claimed and may have sent) carries
                 # the marker.
-                claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
-                                            adapter_profile or "default",
-                                            needs_marker=state != "pending" or attempts > 0, flood=flood_row))
+                claimed.append(_claimed_row(
+                    oid, session_key, platform, chat_id, thread_id, content, attempts,
+                    adapter_profile or "default", reply_to_message_id=reply_to_message_id,
+                    needs_marker=state != "pending" or attempts > 0, flood=flood_row))
     return claimed
 
 
@@ -465,13 +536,14 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id, reply_to_message_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
-        for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
-             owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
+        for (oid, session_key, row_platform, chat_id, thread_id, reply_to_message_id, content,
+             attempts, created_at, owner_pid, owner_started_at, last_error, adapter_profile,
+             updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
                 continue
@@ -499,9 +571,11 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
                 # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
                 # claim released unsent keeps its flood retry eligibility.
-                claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
-                                            attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            flood=is_flood_error(last_error), last_error=last_error))
+                claimed.append(_claimed_row(
+                    oid, session_key, row_platform, chat_id, thread_id, content,
+                    attempts, adapter_profile, reply_to_message_id=reply_to_message_id,
+                    needs_marker=True, runtime=True,
+                    flood=is_flood_error(last_error), last_error=last_error))
     return claimed
 
 

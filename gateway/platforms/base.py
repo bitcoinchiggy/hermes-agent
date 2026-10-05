@@ -156,6 +156,12 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics."""
+    # A queued chain's outer send delivers the LAST turn's body. That turn's
+    # anchor wins, including an explicit None (internal recovery has no
+    # message id and must not inherit the message that opened the chain).
+    if getattr(event, "_terminal_reply_anchor_set", False):
+        anchor = getattr(event, "_terminal_reply_anchor", None)
+        return str(anchor) if anchor else None
     override = getattr(event, "reply_anchor_override", None)
     if override is not None:
         return override  # the turn was redirected onto another message (#115001)
@@ -4239,10 +4245,16 @@ class BasePlatformAdapter(ABC):
 
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
+        reply_to: Optional[str] = None) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None."""
+        or None.
+
+        ``reply_to`` is the immediate reply parent of this send. It is stored beside
+        ``source.thread_id`` and is not replaced by a later event. None leaves the
+        parent column NULL.
+        """
         if is_ephemeral_response or str(event.text or "").lstrip().startswith(
             ("/", self.typed_command_prefix or "!")):
             return None
@@ -4264,7 +4276,8 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                reply_to_message_id=reply_to)
             await asyncio.to_thread(mark_attempting, obligation_id)
             event._delivery_obligation_id = obligation_id
             return obligation_id
@@ -4386,7 +4399,8 @@ class BasePlatformAdapter(ABC):
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            reply_to=reply_to)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(

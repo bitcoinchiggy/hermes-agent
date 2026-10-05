@@ -2211,18 +2211,11 @@ class GatewayTurnMixin:
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
-            # A queued (/queue) chain answered the LAST message of the chain, so the outer final
-            # send (bracketed by the adapter against this event) must be ledgered under that
-            # message's id or it collides with an earlier turn's row carrying the same text. Reply
-            # routing is untouched: the anchor still comes from this event.
-            if isinstance(agent_result, dict):
-                _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
-                if _terminal_inbound:
-                    event.ledger_message_id = str(_terminal_inbound)
-                if "queued_terminal_notification_category" in agent_result:
-                    event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
-                if isinstance(agent_result.get("_notification_reply_muted"), bool):
-                    event._notification_reply_muted = agent_result["_notification_reply_muted"]
+            # A queued chain answered the LAST message. The outer final send is still
+            # bracketed against the event that opened the chain, so the ledger id and
+            # the reply parent both have to move onto that last message. The opening
+            # turn's body was already sent against its own anchor.
+            self._apply_queued_terminal_delivery(event, agent_result)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -3935,7 +3928,38 @@ class GatewayTurnMixin:
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
             }
+        # The outer send delivers THIS follow-up's body. Its reply parent is this
+        # message's anchor, including None when the follow-up is an internal recovery
+        # with no message id. A deeper turn that already named its parent wins. An
+        # event-less steer keeps the parent of the message it continues.
+        if (
+            isinstance(merged, dict)
+            and pending_event is not None
+            and "queued_terminal_reply_anchor" not in merged
+        ):
+            merged = {**merged, "queued_terminal_reply_anchor": next_message_id}
         return merged
+
+    def _apply_queued_terminal_delivery(self, event, agent_result) -> None:
+        """Retarget the opening event's outer final send onto the terminal turn.
+
+        Ledger identity and reply parent follow the last message of a queued chain.
+        The opening turn already delivered its own body against its own anchor.
+        ``queued_terminal_reply_anchor`` may be None: an internal recovery has no
+        message id, and that send must not inherit the opening message.
+        """
+        if not isinstance(agent_result, dict):
+            return
+        terminal_inbound = agent_result.get("queued_terminal_inbound_id")
+        if terminal_inbound:
+            event.ledger_message_id = str(terminal_inbound)
+        if "queued_terminal_reply_anchor" in agent_result:
+            event._terminal_reply_anchor_set = True
+            event._terminal_reply_anchor = agent_result.get("queued_terminal_reply_anchor")
+        if "queued_terminal_notification_category" in agent_result:
+            event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+        if isinstance(agent_result.get("_notification_reply_muted"), bool):
+            event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: "asyncio.Task",
