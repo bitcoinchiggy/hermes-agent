@@ -365,18 +365,15 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def mark_quarantined(obligation_id: str) -> None:
-    """Keep an unanchored Buzz recovery as evidence. This does not publish it or set a parent."""
+def mark_quarantined(obligation_id: str, reason: Optional[str] = None) -> None:
+    """Keep a Buzz recovery as evidence. This does not publish it or set a parent."""
+    text = reason or "quarantined: no recoverable delegation parent; not published"
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
                SET state='quarantined', updated_at=?, last_error=?
                WHERE obligation_id=?""",
-            (
-                time.time(),
-                "quarantined: no recoverable delegation parent; not published",
-                obligation_id,
-            ),
+            (time.time(), text, obligation_id),
         )
 
 
