@@ -101,6 +101,12 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Process-local observer for this event's own ``on_processing_complete``. The adapter-wide
+    # hook stays in place, so concurrent turns cannot replace each other's callbacks.
+    _on_processing_complete: Optional[Any] = field(default=None, init=False, repr=False, compare=False)
+    # Obligation id recorded for this event's final send. Absent until ``send_final_ledgered``
+    # stores that row. A nearby turn in the same session has its own event and its own id.
+    _delivery_obligation_id: Optional[str] = field(default=None, init=False, repr=False, compare=False)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

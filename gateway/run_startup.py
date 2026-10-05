@@ -1521,6 +1521,9 @@ class GatewayStartupMixin:
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        # FLEET_DELEGATION_RECOVERY: one loop, immediate pass, then a bounded retry.
+        from gateway.fleet_delegation import start_fleet_delegation_recovery
+        start_fleet_delegation_recovery(self)
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:

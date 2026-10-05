@@ -1973,6 +1973,9 @@ class GatewayShutdownMixin:
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
+        # FLEET_DELEGATION_RECOVERY: await the loop before the generic cancel clears the set.
+        from gateway.fleet_delegation import stop_fleet_delegation_recovery
+        await stop_fleet_delegation_recovery(self)
         for _task in list(self._background_tasks):
             # _restart_task awaits _stop_task: cancelling it would tunnel into _stop_impl and skip _shutdown_event.set().
             if _task is self._stop_task or _task is self._restart_task:

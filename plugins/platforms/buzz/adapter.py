@@ -1553,6 +1553,21 @@ class BuzzAdapter(BasePlatformAdapter):
             # Mixed kinds use document semantics so an audio member is not mistaken for a voice note (STT).
             kinds = {attachment.kind for attachment in attachments}
             message_type = _ATTACHMENT_KIND_TYPES.get(next(iter(kinds)), MessageType.DOCUMENT) if len(kinds) == 1 else MessageType.DOCUMENT
+        from gateway.fleet_delegation import maybe_handoff_worker_reply
+        # FLEET_DELEGATION_HANDOFF: Control's Fleet integration only. A correlated
+        # worker reply resumes the stored human session and does not dispatch here.
+        if await maybe_handoff_worker_reply(
+            self,
+            channel_id=channel_id,
+            sender_public_key_hex=pubkey,
+            inbound_text=dispatch_text,
+            inbound_event_id=event_id,
+            reply_to_message_id=reply_parent_id,
+            reply_to_text=reply_meta[1] if reply_meta else None,
+            chat_type=chat_type,
+            created_at=created_at,
+        ):
+            return
         await self._dispatch_message(
             text=dispatch_text, chat_id=channel_id, chat_type=chat_type, user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey), message_id=event_id,

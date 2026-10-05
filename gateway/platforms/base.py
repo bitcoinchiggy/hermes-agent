@@ -3554,14 +3554,28 @@ class BasePlatformAdapter(ABC):
             await add(chat_id, message_id, emoji)
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
-        """Run a lifecycle hook without letting failures break message flow."""
+        """Run a lifecycle hook without letting failures break message flow.
+
+        ``on_processing_complete`` also runs an observer stored on that event. The adapter method
+        is left in place, so one turn cannot replace the callback another turn is watching.
+        """
         hook = getattr(self, hook_name, None)
-        if not callable(hook):
+        if callable(hook):
+            try:
+                await hook(*args, **kwargs)
+            except Exception as e:
+                logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
+        if hook_name != "on_processing_complete" or not args:
+            return
+        observer = getattr(args[0], "_on_processing_complete", None)
+        if not callable(observer) or observer is hook:
             return
         try:
-            await hook(*args, **kwargs)
+            result = observer(*args, **kwargs)
+            if inspect.isawaitable(result):
+                await result
         except Exception as e:
-            logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
+            logger.warning("[%s] %s event observer failed: %s", self.name, hook_name, e)
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
@@ -4252,6 +4266,7 @@ class BasePlatformAdapter(ABC):
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
+            event._delivery_obligation_id = obligation_id
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
