@@ -223,6 +223,16 @@ class TestSetChannelCLI:
         """
         import socket
         import subprocess
+        import sys
+
+        # owning_install_root stats <sys.prefix>/../hermes_cli/main.py before
+        # preflight. This process's real prefix is a PM generation under the
+        # real Hermes home, and the home I/O guard correctly refuses that
+        # stat. The install under test is tmp_path, so the probe must read a
+        # temporary prefix outside that home.
+        prefix = tmp_path / "owning-install-prefix" / "venv"
+        prefix.mkdir(parents=True)
+        monkeypatch.setattr(sys, "prefix", str(prefix))
 
         def _sentinel(*_a, **_kw):
             raise AssertionError(
