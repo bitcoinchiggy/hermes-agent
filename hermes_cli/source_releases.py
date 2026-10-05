@@ -16,9 +16,13 @@ logger = logging.getLogger(__name__)
 _PUBLIC_BASE = "https://hermes-assets.nousresearch.com"
 OFFICIAL_REPOSITORY = "NousResearch/hermes-agent"
 _GITHUB_ORIGIN = re.compile(
-    r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"^(?:https://(?:[^@/\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.IGNORECASE,
 )
+# This fork's approved track. The repository name is the selector; there is
+# no config key. Channel ``main`` is the label that follows the git branch.
+FLEET_REPOSITORY = "bitcoinchiggy/hermes-agent"
+FLEET_BRANCH = "fleet"
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -72,12 +76,84 @@ def _resolve_channel(name: str, repository: str):
     return ChannelReader(_PUBLIC_BASE, repository=repository).resolve(name)
 
 
+def fleet_repository(repository: str) -> bool:
+    """True when ``repository`` is the maintained Fleet fork."""
+    return repository.lower() == FLEET_REPOSITORY
+
+
+def fleet_channel_refusal(channel: str) -> str:
+    """Why a channel other than ``main`` cannot be selected on this fork."""
+    return (
+        f"This installation tracks git branch {FLEET_BRANCH}. "
+        f"Channel {channel!r} would select a different commit or branch. "
+        f"The supported channel is main, which follows {FLEET_BRANCH}. "
+        f"Use `hermes update` or `hermes update --branch {FLEET_BRANCH}`."
+    )
+
+
+def fleet_branch_refusal(branch: str) -> str:
+    """Why an explicit branch other than ``fleet`` cannot be selected on this fork."""
+    return (
+        f"This installation tracks git branch {FLEET_BRANCH}. "
+        f"`hermes update --branch {branch}` would leave that track. "
+        f"Use `hermes update --branch {FLEET_BRANCH}` or plain `hermes update`."
+    )
+
+
+def reject_fleet_channel(channel: str, repository: str) -> None:
+    """Refuse a channel that would leave git branch ``fleet`` on this fork.
+
+    ``NousResearch/hermes-agent`` and every other repository are unchanged.
+    """
+    if fleet_repository(repository) and channel != "main":
+        raise ValueError(fleet_channel_refusal(channel))
+
+
+def reject_fleet_branch(branch: str, repository: str) -> None:
+    """Refuse an explicit ``--branch`` that would leave ``fleet`` on this fork.
+
+    ``--branch fleet`` stays the one-run override. Other repositories may
+    still name any branch.
+    """
+    if fleet_repository(repository) and branch != FLEET_BRANCH:
+        raise ValueError(fleet_branch_refusal(branch))
+
+
+def fleet_track_note(target: SourceTarget) -> str | None:
+    """Operator notice when this fork resolved to ``fleet`` without using a record."""
+    if (target.commit is None and target.branch == FLEET_BRANCH
+            and fleet_repository(target.repository)):
+        return (
+            f"→ Tracking git branch {FLEET_BRANCH}. "
+            "A published channel record is not used."
+        )
+    return None
+
+
+def _fleet_main_target(channel: str, repository: str) -> SourceTarget | None:
+    """This fork's track for channel ``main``, ignoring any published record.
+
+    ``None`` means the caller is not that fork and must use the upstream rules.
+    Any other channel is refused before a record can detach the checkout.
+    """
+    if not fleet_repository(repository):
+        return None
+    reject_fleet_channel(channel, repository)
+    return SourceTarget(channel, channel, repository, branch=FLEET_BRANCH)
+
+
 def resolve_source_target(channel: str, git_cmd=None, cwd=None, *, repository=None) -> SourceTarget:
     """Resolve every subscription, including default labels, through R2."""
     from hermes_cli.release_channels import ChannelNotFound, validate_name
 
     validate_name(channel)
     repository = repository or source_repository(git_cmd, cwd)
+    # bitcoinchiggy/hermes-agent follows git branch fleet for channel main
+    # whether or not a record exists. A later published commit must not detach
+    # the checkout, and a CDN failure must not block that track.
+    tracked = _fleet_main_target(channel, repository)
+    if tracked is not None:
+        return tracked
     try:
         resolved = _resolve_channel(channel, repository)
     except ChannelNotFound:

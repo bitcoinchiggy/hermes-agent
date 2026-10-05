@@ -61,6 +61,11 @@ def channel_compare_branch(selected_channel: str, git_cmd: list[str], root: Path
         print(f"✗ Could not resolve the {selected_channel} source channel: {exc}")
         sys.exit(1)
     if not target.commit:
+        from hermes_cli.source_releases import fleet_track_note
+
+        note = fleet_track_note(target)
+        if note:
+            print(note)
         return target.branch
     if target.retired:
         print(f"→ {selected_channel} retired; source destination: {target.channel}")

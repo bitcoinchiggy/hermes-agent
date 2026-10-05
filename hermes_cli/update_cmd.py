@@ -659,7 +659,15 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
     _check.clear_git_debris(root)
 
     selected_channel = _source_update_channel(channel=channel, branch_explicit=branch_explicit)
-    if not branch_explicit:
+    if branch_explicit:
+        from hermes_cli.source_releases import reject_fleet_branch, source_repository
+
+        try:
+            reject_fleet_branch(branch, source_repository(git_cmd, root))
+        except ValueError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+    else:
         branch = _check.channel_compare_branch(selected_channel, git_cmd, root)
         if branch is None:
             return
@@ -1483,6 +1491,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
     release_sha = None
     target_repository = None
     selected_channel = _source_update_channel(args)
+    if getattr(args, "branch", None):
+        from hermes_cli.source_releases import reject_fleet_branch, source_repository
+
+        try:
+            reject_fleet_branch(
+                branch,
+                source_repository(None if use_zip_update else git_cmd, _m().PROJECT_ROOT),
+            )
+        except ValueError as exc:
+            print(f"✗ {exc} No update was applied.")
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            sys.exit(1)
     if not getattr(args, "branch", None):
         from hermes_cli.release_channels import retrying_reads
         from hermes_cli.source_releases import resolve_source_target
@@ -1510,6 +1530,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "original": original_record, "destination": target.channel}
         target_repository = target.repository
         release_sha = target.commit
+        from hermes_cli.source_releases import fleet_track_note
+
+        note = fleet_track_note(target)
+        if note:
+            print(note)
         if release_sha:
             print(f"→ Latest release: {target.label}")
             target_ref = release_sha

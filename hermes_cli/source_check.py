@@ -17,7 +17,14 @@ import urllib.error
 import urllib.request
 
 from hermes_constants import get_hermes_home
-from hermes_cli.source_releases import OFFICIAL_REPOSITORY, _GITHUB_ORIGIN, resolve_source_target
+from hermes_cli.source_releases import (
+    FLEET_BRANCH,
+    OFFICIAL_REPOSITORY,
+    _GITHUB_ORIGIN,
+    fleet_repository,
+    reject_fleet_branch,
+    resolve_source_target,
+)
 
 logger = logging.getLogger(__name__)
 UPDATE_AVAILABLE_NO_COUNT = -1
@@ -398,9 +405,21 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
         return {**result, "reason": "disabled"}
     channel = resolve_update_channel(config, root) if channel is None else validate_name(channel)
     co = _read_checkout(root, git, embedded)
+    if branch is not None:
+        try:
+            reject_fleet_branch(branch, co.repository or OFFICIAL_REPOSITORY)
+        except ValueError as exc:
+            result.update(supported=True, currentSha=co.head, currentBranch=co.current_branch,
+                          dirty=co.dirty, error="release-unavailable", message=str(exc))
+            return result
     desktop_config = _read_json(branch_config_path) if branch_config_path else None
     configured_branch = _configured_branch(desktop_config)
     selected_branch = branch or configured_branch or _checked_out_branch(co.current_branch, "main")
+    if (branch is None and channel == "main"
+            and fleet_repository(co.repository or OFFICIAL_REPOSITORY)):
+        # Chosen before the cache key is built, so a checkout sitting on
+        # another branch still compares origin/fleet on every later read.
+        selected_branch = FLEET_BRANCH
     result.update(supported=True, currentSha=co.head, currentBranch=co.current_branch, dirty=co.dirty)
     if channel != "main":
         result["channel"] = channel
@@ -420,8 +439,15 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     elif branch is None:
         source_target = _resolve_channel(result, channel, co)
         if source_target is not None and not source_target.commit:
-            # The record supplies a default, not permission to leave the user's branch.
-            selected_branch = configured_branch or _checked_out_branch(co.current_branch, source_target.branch)
+            if fleet_repository(source_target.repository) and source_target.branch == FLEET_BRANCH:
+                # This fork's approved track wins over the checked-out branch
+                # and over a Desktop branch setting. A published record is not
+                # a reason to compare origin/main.
+                selected_branch = FLEET_BRANCH
+            else:
+                # The record supplies a default, not permission to leave the user's branch.
+                selected_branch = configured_branch or _checked_out_branch(
+                    co.current_branch, source_target.branch)
     if "error" not in result and (source_target is None or source_target.branch is not None):
         # Only a Desktop-configured branch the caller did not override is healed.
         heal = branch_config_path and not branch and configured_branch == selected_branch

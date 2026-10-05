@@ -176,6 +176,15 @@ def resolve_update_channel(
     return default_channel(root)
 
 
+def _checkout_repository(root: Path) -> str:
+    """GitHub repository for a source checkout, or the official repo otherwise."""
+    from hermes_cli.source_releases import OFFICIAL_REPOSITORY, source_repository
+
+    if not (root / ".git").exists():
+        return OFFICIAL_REPOSITORY
+    return source_repository(["git"], root)
+
+
 def set_install_channel(
     channel: str,
     project_root: Optional[Path] = None,
@@ -200,6 +209,14 @@ def set_install_channel(
             f"channels don't apply here; updates are owned by {distribution}"
         )
 
+    # Refuse before the record is written, so a bad name is not stored and
+    # every later update left failing closed. A tree without .git is not
+    # this fork's source checkout, and looking it up would spawn git.
+    if (root / ".git").exists():
+        from hermes_cli.source_releases import reject_fleet_channel
+
+        reject_fleet_channel(channel, _checkout_repository(root))
+
     sha16 = install_id(root)
     _write_channel_record(sha16, str(root), channel)
     return sha16
@@ -219,6 +236,11 @@ def handle_metadata_args(args, project_root: Path) -> bool:
         print(str(exc))
         raise SystemExit(2) from exc
     print(f"Update channel for {key}: {channel}")
+    if channel == CHANNEL_MAIN:
+        from hermes_cli.source_releases import FLEET_BRANCH, fleet_repository
+
+        if fleet_repository(_checkout_repository(project_root)):
+            print(f"Channel main on this installation follows git branch {FLEET_BRANCH}.")
     if channel == CHANNEL_CANARY:
         print("Canary builds can write forward-incompatible state. Back up your data before switching.")
     elif channel == CHANNEL_STABLE:
