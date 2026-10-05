@@ -420,3 +420,91 @@ def test_journal_channel_is_known_without_reading_the_task(tmp_path, monkeypatch
         )
         == "normal"
     )
+
+
+def test_hold_is_reread_and_blocks_recovered_sends(monkeypatch, tmp_path):
+    """Restart reads the hold file again. Human-chat obligations still send."""
+    import json
+
+    from gateway.platforms.base import SendResult
+    from gateway.run import GatewayRunner
+    from gateway.fleet_coordination import held_chat_ids
+
+    home = tmp_path / "home"
+    (home / "buzz").mkdir(parents=True)
+    db = home / "state.db"
+    monkeypatch.setattr("gateway.delivery_ledger._db_path", lambda: db)
+    monkeypatch.setattr("gateway.fleet_coordination._home", lambda: home)
+    hold = {"chats": [LEGACY], "reason": "legacy-coordination-replay"}
+    (home / "buzz" / "coordination-dispatch-hold.json").write_text(json.dumps(hold), encoding="utf-8")
+    assert held_chat_ids() == frozenset({LEGACY})
+    assert held_chat_ids() == frozenset({LEGACY})
+
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            state TEXT,
+            last_error TEXT,
+            updated_at REAL
+        )"""
+    )
+    rows = [
+        ("startup", "gateway is online", None, False),
+        ("error", "HTTP 402", "ab" * 32, False),
+        ("response", "the worker finished", None, False),
+        ("recovered", "kept result", "cd" * 32, True),
+        ("human", "report to the operator", None, True),
+    ]
+    for obligation_id, _content, _parent, _marker in rows:
+        conn.execute(
+            "INSERT INTO delivery_obligations VALUES (?, 'pending', NULL, 0)",
+            (obligation_id,),
+        )
+    conn.commit()
+    conn.close()
+
+    sent: list[str] = []
+
+    class Adapter:
+        async def send(self, *, chat_id, content, reply_to=None, metadata=None):
+            sent.append(str(chat_id))
+            return SendResult(success=True, message_id="sent")
+
+    runner = object.__new__(GatewayRunner)
+    runner._obligation_adapter = AsyncMock(return_value=Adapter())
+    runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+    claimed = []
+    for obligation_id, content, parent, marker in rows:
+        chat = OTHER if obligation_id == "human" else LEGACY
+        claimed.append(
+            {
+                "adopted": False,
+                "obligation_id": obligation_id,
+                "platform": "buzz",
+                "chat_id": chat,
+                "thread_id": None,
+                "reply_to_message_id": parent,
+                "content": content,
+                "needs_marker": marker,
+                "attempts": 1,
+            }
+        )
+    count = asyncio.run(GatewayRunner._redeliver_claimed_obligations(runner, claimed))
+    assert count == 1
+    assert sent == [OTHER]
+    stored = {
+        row[0]: row[1:]
+        for row in sqlite3.connect(db).execute(
+            "SELECT obligation_id, state, last_error FROM delivery_obligations"
+        )
+    }
+    assert stored["human"][0] == "delivered"
+    for obligation_id in ("startup", "error", "response", "recovered"):
+        assert stored[obligation_id][0] == "quarantined"
+        assert stored[obligation_id][1] == "quarantined: coordination dispatch hold; not published"
+    count_again = asyncio.run(GatewayRunner._redeliver_claimed_obligations(runner, claimed))
+    assert count_again == 1
+    assert sent == [OTHER, OTHER]

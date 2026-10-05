@@ -4,7 +4,8 @@ Startup redelivery sends every ``pending``, ``attempting``, and ``failed``
 Buzz obligation. Startup also resumes sessions marked ``resume_pending``.
 The Buzz cursor fetches relay events newer than ``last_ts`` that are not
 in ``seen``. Those three stores can revive a coordination-DM reply loop
-even when the parent is not a delegation.
+even when the parent is not a delegation. The database copy is a SQLite
+backup, so uncheckpointed WAL commits are in that file.
 
 Selection is the chat id. Startup notices, error sends, and ordinary
 responses in that chat are all included. Message text only labels the
@@ -295,8 +296,10 @@ def _backup(root: Path, backup_dir: Path) -> Path:
     if destination.exists():
         raise QuarantineError("quarantine backup already exists")
     destination.mkdir(parents=False)
+    database = root / "state.db"
+    if database.is_file() and not database.is_symlink():
+        _backup_sqlite(database, destination / "state.db")
     for relative in (
-        Path("state.db"),
         Path("sessions") / "sessions.json",
         Path("buzz") / "channel-cursors.json",
     ):
@@ -307,6 +310,20 @@ def _backup(root: Path, backup_dir: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
     return destination
+
+
+def _backup_sqlite(source: Path, target: Path) -> None:
+    """One consistent file, including commits that are still in the WAL."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        dest = sqlite3.connect(target)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        src.close()
 
 
 def _quarantine_obligations(path: Path, targets: list[str], now: float) -> int:

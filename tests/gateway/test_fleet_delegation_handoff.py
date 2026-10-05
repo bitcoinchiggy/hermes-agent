@@ -463,6 +463,85 @@ class FleetGatewayBoundaryTests(unittest.TestCase):
         self.assertEqual(stored["reply_event_ids"], [inbound])
         self.assertEqual(stored["reply_deliveries"][0]["state"], "completed")
 
+    def test_hold_keeps_a_pending_result_and_does_not_replay_the_loop(self) -> None:
+        from fleet_control.journal import read_record
+        from gateway.fleet_coordination import held_chat_ids
+
+        receipt = self._delegate()
+        before = (self.journal / f"{receipt['delegation_id']}.json").read_bytes()
+        home = Path(self.tmp.name) / "hold-home"
+        (home / "buzz").mkdir(parents=True)
+        (home / "buzz" / "coordination-dispatch-hold.json").write_text(
+            json.dumps({"chats": ["worker-dm"], "reason": "legacy-coordination-replay"}),
+            encoding="utf-8",
+        )
+        import gateway.fleet_coordination as coordination
+
+        original_home = coordination._home
+        coordination._home = lambda: home
+        try:
+            self.assertEqual(held_chat_ids(), frozenset({"worker-dm"}))
+            worker, human = self._adapters()
+            wakes: list[str] = []
+
+            async def evaluate(event):
+                wakes.append(event.text)
+                return "The operator finished the check."
+
+            human.set_message_handler(evaluate)
+            loop_parent = "cd" * 32
+
+            async def traffic(adapter) -> None:
+                state = self._state()
+                await adapter._handle_event(
+                    "worker-dm",
+                    state,
+                    self._event("11" * 32, self.worker_hex, None, "gateway is online"),
+                )
+                await adapter._handle_event(
+                    "worker-dm",
+                    state,
+                    self._event("22" * 32, self.worker_hex, loop_parent, "HTTP 402"),
+                )
+                await adapter._handle_event(
+                    "worker-dm",
+                    state,
+                    self._event("44" * 32, self.worker_hex, receipt["event_id"], WORKER_REPLY),
+                )
+                origin = adapter.gateway_runner.adapters[Platform.TELEGRAM]
+                tasks = [task for task in origin._session_tasks.values() if hasattr(task, "done")]
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            asyncio.run(traffic(worker))
+            self.assertEqual(worker.sent, [])
+            self.assertEqual(len(wakes), 1)
+            self.assertIn("operator finished the marker", wakes[0])
+            self.assertNotIn("HTTP 402", wakes[0])
+            self.assertEqual(len(human.sent), 1)
+            self.assertEqual(human.sent[0]["chat_id"], "424242")
+            self.assertEqual(human.sent[0]["content"], "The operator finished the check.")
+            stored = read_record(self.journal, receipt["delegation_id"])
+            assert stored is not None
+            self.assertEqual(stored["origin_chat_id"], "424242")
+            self.assertIn(receipt["event_id"], json.dumps(stored))
+            self.assertNotEqual(before, b"")
+            restarted, human_again = self._adapters()
+            human_again.set_message_handler(evaluate)
+            asyncio.run(
+                restarted._handle_event(
+                    "worker-dm",
+                    self._state(),
+                    self._event("22" * 32, self.worker_hex, loop_parent, "HTTP 402"),
+                )
+            )
+            self.assertEqual(len(wakes), 1)
+            self.assertEqual(len(human.sent), 1)
+            self.assertEqual(restarted.sent, [])
+            self.assertEqual(held_chat_ids(), frozenset({"worker-dm"}))
+        finally:
+            coordination._home = original_home
+
     def _delivery_state(self, delegation_id: str) -> str:
         from fleet_control.journal import read_record
 

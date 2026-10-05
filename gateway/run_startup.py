@@ -442,6 +442,24 @@ class GatewayStartupMixin:
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
+            # A quarantine hold covers every Buzz send in that chat, including a
+            # recovered parented row. The human chat is a different id and is sent.
+            held_chat = str(row.get("chat_id") or "").strip().lower()
+            if str(row.get("platform") or "") == "buzz" and held_chat:
+                from gateway.fleet_coordination import held_chat_ids
+
+                if held_chat in held_chat_ids():
+                    with _log_suppressed(logging.DEBUG, "coordination hold quarantine failed", exc_info=True):
+                        await asyncio.to_thread(
+                            mark_quarantined,
+                            row["obligation_id"],
+                            "quarantined: coordination dispatch hold; not published",
+                        )
+                    logger.info(
+                        "Held coordination dispatch for %s (obligation %s); not published",
+                        row.get("chat_id"), row.get("obligation_id"),
+                    )
+                    continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue

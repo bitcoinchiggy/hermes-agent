@@ -174,6 +174,46 @@ def test_apply_backs_up_and_leaves_other_work(tmp_path):
     assert mirror["agent:main:buzz:dm:" + CHAT]["resume_pending"] is False
 
 
+def test_backup_includes_uncheckpointed_wal_rows(tmp_path):
+    home = tmp_path / "wal-home"
+    (home / "sessions").mkdir(parents=True)
+    (home / "buzz").mkdir()
+    db = home / "state.db"
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute(
+        """CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            platform TEXT,
+            chat_id TEXT,
+            state TEXT,
+            content TEXT,
+            reply_to_message_id TEXT,
+            updated_at REAL,
+            last_error TEXT
+        )"""
+    )
+    writer.execute(
+        "INSERT INTO delivery_obligations VALUES ('wal-row', 'buzz', ?, 'pending', 'gateway is online', NULL, 0, NULL)",
+        (CHAT,),
+    )
+    writer.commit()
+    wal = home / "state.db-wal"
+    assert wal.is_file() and wal.stat().st_size > 0
+    report = plan_quarantine(home, chats=[CHAT])
+    assert [item["obligation_id"] for item in report["outbound"]] == ["wal-row"]
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    apply_quarantine(home, report, backup_dir=backup / "copy")
+    copied = sqlite3.connect(backup / "copy" / "state.db")
+    try:
+        assert copied.execute("SELECT obligation_id FROM delivery_obligations").fetchone()[0] == "wal-row"
+    finally:
+        copied.close()
+    writer.close()
+
+
 def test_live_home_and_nested_backup_are_refused(tmp_path):
     home = _home(tmp_path)
     report = plan_quarantine(home, chats=[CHAT])
