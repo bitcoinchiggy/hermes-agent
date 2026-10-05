@@ -1533,6 +1533,7 @@ def dump_api_request_debug(
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
+        prune_request_dumps(agent.logs_dir, safe_sid)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
             print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
@@ -1541,6 +1542,61 @@ def dump_api_request_debug(
         if agent.verbose_logging:
             logger.warning("Failed to dump API request debug payload: %s", dump_error)
         return None
+
+
+def prune_request_dumps(logs_dir: Path, session_id: str, *, keep: int = 20, max_bytes: int = 256 * 1024 * 1024) -> None:
+    """Keep the newest request dumps for one session, then the newest bytes overall.
+
+    Only ``request_dump_*.json`` files are removed. Session transcripts and
+    journals are not. The newest dump for ``session_id`` is kept even when
+    that one file is larger than ``max_bytes``.
+    """
+    if keep < 1 or max_bytes < 1 or not isinstance(logs_dir, Path):
+        return
+    try:
+        own = _request_dump_files(logs_dir, f"request_dump_{session_id}_")
+        own.sort(key=lambda path: (path.stat().st_mtime, path.name))
+        for path in own[:-keep]:
+            _unlink_dump(path)
+        newest = own[-1] if own else None
+        remaining = _request_dump_files(logs_dir, "request_dump_")
+        total = sum(path.stat().st_size for path in remaining)
+        if total <= max_bytes:
+            return
+        remaining.sort(key=lambda path: (path.stat().st_mtime, path.name))
+        for path in remaining:
+            if total <= max_bytes:
+                break
+            if newest is not None and path.resolve() == newest.resolve():
+                continue
+            size = path.stat().st_size
+            if _unlink_dump(path):
+                total -= size
+    except Exception:
+        logger.warning("Failed to prune API request debug dumps", exc_info=True)
+
+
+def _request_dump_files(logs_dir: Path, prefix: str) -> list[Path]:
+    found: list[Path] = []
+    if not logs_dir.is_dir():
+        return found
+    for path in logs_dir.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.name.startswith(prefix) and path.suffix == ".json":
+            found.append(path)
+    return found
+
+
+def _unlink_dump(path: Path) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.warning("Failed to remove request dump %s", path.name, exc_info=True)
+        return False
+    return True
 
 
 def _direct_native_anthropic_tool_cache_capability(
