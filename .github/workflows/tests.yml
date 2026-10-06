@@ -28,8 +28,13 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    # One pytest process per file. Upstream runs 32 of them on the 32-core
+    # larger runner and finishes inside 30 minutes. This fork has no larger
+    # runners. The public ubuntu-latest image is 4 vCPU and 16 GB, so the
+    # same files run four at a time and the job is allowed longer to finish.
+    # Thirty-two processes on that image would oversubscribe its memory.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-32-core' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ github.repository == 'NousResearch/hermes-agent' && 30 || 240 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -91,7 +96,7 @@ jobs:
         run: |
           scripts/run_tests.sh
         env:
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '32' || '4' }}
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -110,6 +115,8 @@ jobs:
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # The public ubuntu-latest image is that 4-vCPU class, so this job keeps
+    # the upstream 32-core label on the fork as well. It is not skipped.
     if: inputs.e2e
     runs-on: ubuntu-latest-32-core
     timeout-minutes: 30
@@ -229,6 +236,10 @@ jobs:
     # suites below it (pm: PM environment lifecycle across updates, ...).
     # Its own job: it needs full history + tags, bubblewrap, and one file
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
+    # Six concurrent installers are one wave on the 32-core runner. The
+    # same width on a 4-vCPU image is the starvation the worker cap avoids,
+    # and a public runner has no wider machine, so this job keeps the
+    # upstream label. It is not skipped.
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
     runs-on: ubuntu-latest-32-core
