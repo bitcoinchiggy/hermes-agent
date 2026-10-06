@@ -219,7 +219,7 @@ def _routing_entries(root: Path) -> list[tuple[str, dict]]:
     mirror = root / "sessions" / "sessions.json"
     if mirror.is_file() and not mirror.is_symlink() and not found:
         try:
-            payload = json.loads(mirror.read_text(encoding="utf-8"))
+            payload = json.loads(mirror.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             payload = None
         if isinstance(payload, dict):
@@ -234,7 +234,7 @@ def _cursors(path: Path, targets: list[str]) -> list[dict]:
     if path.is_symlink() or not path.is_file():
         return []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return []
     channels = payload.get("channels") if isinstance(payload, dict) else None
@@ -264,7 +264,7 @@ def _delegations(journal_dir: Optional[Path]) -> list[dict]:
         if path.is_symlink() or not path.is_file():
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
@@ -390,7 +390,7 @@ def _clear_resume(root: Path, targets: list[str]) -> int:
     mirror = root / "sessions" / "sessions.json"
     if mirror.is_file() and not mirror.is_symlink():
         try:
-            payload = json.loads(mirror.read_text(encoding="utf-8"))
+            payload = json.loads(mirror.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             payload = None
         if isinstance(payload, dict):

@@ -49,7 +49,7 @@ def coordination_chat_id() -> Optional[str]:
     try:
         import hermes_yaml as yaml
 
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
     except Exception:
         # An unreadable setting does not identify the coordination DM.
         # Recovery publishes the row instead of quarantining every Buzz chat.
@@ -176,7 +176,7 @@ def _read_file(path: Path) -> Optional[dict]:
     if path.is_symlink() or not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):

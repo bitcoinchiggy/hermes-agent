@@ -111,7 +111,7 @@ def _read_known(home: Optional[Path]) -> tuple[str, ...]:
     if path.is_symlink() or not path.is_file():
         return ()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         logger.warning("Coordination destination cache was not read", exc_info=True)
         return ()
@@ -171,7 +171,7 @@ def load_coordination_settings(path: Optional[Path] = None) -> CoordinationSetti
     try:
         import hermes_yaml as yaml
 
-        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+        loaded = yaml.safe_load(target.read_text(encoding="utf-8-sig"))
     except Exception:
         logger.warning("Coordination settings were not read", exc_info=True)
         return CoordinationSettings(status="unreadable", remembered=remembered)
@@ -239,7 +239,7 @@ def journal_chat_ids(directory: Optional[Path] = None) -> frozenset[str]:
         if path.is_symlink() or not path.is_file():
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict) or not isinstance(payload.get("delegation_id"), str):
@@ -259,7 +259,7 @@ def held_chat_ids(home: Optional[Path] = None) -> frozenset[str]:
     if path.is_symlink() or not path.is_file():
         return frozenset()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         logger.warning("Coordination dispatch hold was not read", exc_info=True)
         return frozenset()

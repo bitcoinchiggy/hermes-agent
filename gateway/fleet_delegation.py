@@ -463,7 +463,7 @@ async def _retry_unavailable_holds(adapter: Any) -> None:
         if path.is_symlink() or not path.is_file():
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
