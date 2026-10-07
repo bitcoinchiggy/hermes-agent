@@ -97,6 +97,18 @@ def test_broken_yaml_serves_last_good_and_fail_closed_raises(homes):
         load_user_config_effective(home / "config.yaml", fail_closed=True)
 
 
+def test_reject_non_mapping_does_not_trust_a_collapsed_cache(homes):
+    """A list root is not "no keys". Callers that keep their own last-good state
+    must still see the type error after another reader collapsed that file to {}."""
+    from hermes_cli.config_effective import load_user_config_effective
+
+    home, _ = homes
+    _write(home / "config.yaml", "- not-a-mapping\n")
+    assert load_user_config_effective(home / "config.yaml") == {}
+    with pytest.raises(TypeError):
+        load_user_config_effective(home / "config.yaml", fail_closed=True, reject_non_mapping=True)
+
+
 def test_good_backup_is_written_only_for_the_active_home(homes, tmp_path):
     """Reading ANOTHER profile's config (doctor, TUI cwd lookup) is a read: it must not create
     ``backups/config/`` inside that profile. The active home keeps the last-good copy."""

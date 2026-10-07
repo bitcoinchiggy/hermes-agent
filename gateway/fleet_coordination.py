@@ -88,6 +88,21 @@ def _home() -> Optional[Path]:
         return None
 
 
+def _read_config_mapping(path: Path) -> dict:
+    """Effective user config for this home.
+
+    Parse errors and a non-mapping root raise. Callers turn that into an
+    unidentified destination and keep the last ready chat ids. A UTF-8 BOM
+    is accepted. Defaults are not merged, so a missing fleet key stays absent.
+    """
+    from hermes_cli.config_effective import load_user_config_effective
+
+    loaded = load_user_config_effective(path, fail_closed=True, reject_non_mapping=True)
+    if not isinstance(loaded, dict):
+        raise ValueError("coordination config is not a mapping")
+    return loaded
+
+
 def settings_path() -> Optional[Path]:
     """Config beside the delivery ledger. A missing file is not a destination."""
     home = _home()
@@ -169,9 +184,7 @@ def load_coordination_settings(path: Optional[Path] = None) -> CoordinationSetti
             return CoordinationSettings(status="unreadable", remembered=remembered)
         return CoordinationSettings(status="absent", remembered=())
     try:
-        import hermes_yaml as yaml
-
-        loaded = yaml.safe_load(target.read_text(encoding="utf-8-sig"))
+        loaded = _read_config_mapping(target)
     except Exception:
         logger.warning("Coordination settings were not read", exc_info=True)
         return CoordinationSettings(status="unreadable", remembered=remembered)

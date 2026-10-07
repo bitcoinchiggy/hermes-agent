@@ -47,9 +47,9 @@ def coordination_chat_id() -> Optional[str]:
     if path.is_symlink() or not path.is_file():
         return None
     try:
-        import hermes_yaml as yaml
+        from gateway.fleet_coordination import _read_config_mapping
 
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+        loaded = _read_config_mapping(path)
     except Exception:
         # An unreadable setting does not identify the coordination DM.
         # Recovery publishes the row instead of quarantining every Buzz chat.
