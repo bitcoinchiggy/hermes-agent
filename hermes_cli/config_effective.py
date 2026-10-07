@@ -49,7 +49,10 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> Dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> Dict[str, Any]:
+def load_user_config_effective(
+    config_path: Optional[Path] = None, *, fail_closed: bool = False,
+    reject_non_mapping: bool = False,
+) -> Dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -59,21 +62,29 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     last-good state); otherwise the last successfully parsed user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    ``reject_non_mapping=True`` raises ``TypeError`` when the document parses but its root is
+    not a mapping (including an empty document). That is not collapsed to ``{}``, and a previous
+    collapse cached for another caller is not reused. Callers that treat ``{}`` as "no keys"
+    must not set it. Cached on the user + managed file signatures and the values of every
+    referenced env var."""
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
         cached = _EFFECTIVE_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
+        # A collapsed list or empty document is cached as {}. A caller that
+        # rejects that root must re-read it; a non-empty cache is a real mapping.
+        cache_trusted = (not reject_non_mapping) or bool(cached and cached[8])
+        if cache_trusted and cached is not None and cache_sig is not None and cached[:8] == cache_sig:
             if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
                 return copy.deepcopy(cached[8])
 
         raw: Dict[str, Any] = {}
         recovered = False
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
-        if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
+        raw_trusted = (not reject_non_mapping) or bool(raw_hit and raw_hit[4])
+        if raw_trusted and user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
             raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
             _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
         elif user_sig is not None:
@@ -85,6 +96,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     raise
                 raw, recovered = _recover_user_raw(config_path, path_key, exc), True
             else:
+                if reject_non_mapping and not isinstance(loaded, dict):
+                    raise TypeError(
+                        f"top-level YAML must be a mapping, got {type(loaded).__name__}"
+                    )
                 raw = loaded if isinstance(loaded, dict) else {}
                 _config._RAW_CONFIG_CACHE[path_key] = (*user_sig, copy.deepcopy(raw))
                 _LAST_GOOD_USER_RAW[path_key] = copy.deepcopy(raw)

@@ -336,12 +336,22 @@ def _run_intake(payload: dict) -> dict:
     body.setdefault("gateway_owner", _GATEWAY_OWNER)
     body.setdefault("gateway_pid", os.getpid())
     try:
+        from tools.environments.local import build_subprocess_env
+
+        # Scrub credentials and, when a routed home is active, drop the launch
+        # profile's dotenv before the helper reads the journal. A builder
+        # failure is the same as a missing helper: no dispatch.
+        child_env = build_subprocess_env(strip_launch_profile=True)
+    except Exception:
+        logger.warning("fleet delegation intake environment was not built", exc_info=True)
+        return {"status": "unavailable"}
+    try:
         proc = subprocess.run(
             [binary],
             input=json.dumps(body).encode("utf-8"),
             capture_output=True,
             timeout=_INTAKE_TIMEOUT_SECONDS,
-            env=os.environ.copy(),
+            env=child_env,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):

@@ -387,6 +387,28 @@ def test_unreadable_config_remembers_the_last_ready_destination(tmp_path, monkey
     assert malformed.assigner_pubkey is None
 
 
+def test_non_mapping_config_keeps_the_last_ready_destination(tmp_path, monkeypatch):
+    from gateway.buzz_recovery_quarantine import coordination_chat_id
+    from gateway.fleet_coordination import load_coordination_settings
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("gateway.fleet_coordination._home", lambda: home)
+    monkeypatch.setattr("gateway.delivery_ledger._db_path", lambda: home / "state.db")
+    (home / "config.yaml").write_text(
+        "fleet:\n"
+        f"  coordination_channel_id: {CHANNEL}\n"
+        f"  control_coordination_chat_id: {LEGACY}\n",
+        encoding="utf-8",
+    )
+    assert load_coordination_settings().status == "ready"
+    (home / "config.yaml").write_text("- not-a-mapping\n", encoding="utf-8")
+    broken = load_coordination_settings()
+    assert broken.status == "unreadable"
+    assert broken.known_chats() == frozenset({CHANNEL, LEGACY})
+    assert coordination_chat_id() is None
+
+
 def test_journal_channel_is_known_without_reading_the_task(tmp_path, monkeypatch):
     from gateway.fleet_coordination import journal_chat_ids
 
